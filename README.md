@@ -63,5 +63,8 @@ Once the server is running, open your web browser and click this link:
 
 <div align="center">
   <b>Developed by <a href="https://github.com/jackel7">Jackel</a></b><br>
-  <i>Flutter & Full-Stack Developer</i>
+  <b>Connect with me <a href="https://www.linkedin.com/in/muhammad-ali-naeem-93898b308/"></a></b><br>
+
+  
+  <i>Flutter Developer</i>
 </div>
