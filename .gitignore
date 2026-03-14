@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Downloaded files
+downloads/
+*.mp4
+*.mp3
+*.mkv
+*.webm
+
+# Virtual environments
+venv/
+env/
+.env
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Any local settings
+.vscode/
