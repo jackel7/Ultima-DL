@@ -287,11 +287,12 @@ def extract_playlist():
         return jsonify({'error': f'Could not extract playlist. {str(e)[:200]}'}), 500
 
 
-@app.route('/download', methods=['POST'])
-def download():
-    """Download a video/audio in the selected format and stream to browser."""
-    import yt_dlp
+# Store single video download progress
+single_progress = {}
 
+@app.route('/start_download', methods=['POST'])
+def start_download():
+    """Start a single video/audio download and return a session_id."""
     data = request.get_json()
     url = data.get('url', '').strip()
     format_id = data.get('format_id', '')
@@ -300,8 +301,37 @@ def download():
     if not url or not format_id:
         return jsonify({'error': 'Missing URL or format selection.'}), 400
 
-    unique_id = str(uuid.uuid4())[:8]
+    session_id = str(uuid.uuid4())[:12]
+    single_progress[session_id] = {
+        'status': 'starting',
+        'percent': '0%',
+        'done': False,
+        'error': None,
+        'file_path': None,
+        'safe_title': None
+    }
+    
+    threading.Thread(
+        target=_single_download_worker,
+        args=(url, format_id, category, session_id),
+        daemon=True
+    ).start()
+    
+    return jsonify({'session_id': session_id})
+
+def _single_download_worker(url, format_id, category, session_id):
+    import yt_dlp
+    prog = single_progress[session_id]
+    
+    unique_id = session_id[:8]
     temp_template = os.path.join(DOWNLOAD_DIR, f'{unique_id}_%(title)s.%(ext)s')
+
+    def progress_hook(d):
+        if d['status'] == 'downloading':
+            p = d.get('_percent_str', '0%')
+            p = re.sub(r'\x1b[^m]*m', '', p).strip()  # remove ansi formatting
+            prog['percent'] = p
+            prog['status'] = f"Downloading... {p}"
 
     ydl_opts = {
         'nocheckcertificate': True,
@@ -311,6 +341,7 @@ def download():
         'restrictfilenames': True,
         'noplaylist': True,
         'socket_timeout': 30,
+        'progress_hooks': [progress_hook],
     }
 
     if category == 'pro':
@@ -328,7 +359,9 @@ def download():
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            prog['status'] = 'Fetching info...'
             info = ydl.extract_info(url, download=True)
+            prog['status'] = 'Finalizing file...'
             title = sanitize_filename(info.get('title', 'video'))
 
             downloaded_file = None
@@ -338,28 +371,21 @@ def download():
                     break
 
             if not downloaded_file or not os.path.exists(downloaded_file):
-                return jsonify({'error': 'Download failed. File not found.'}), 500
+                raise Exception('Download failed. File not found.')
 
             ext = os.path.splitext(downloaded_file)[1]
-            if category == 'audio':
+            if category == 'audio' and ext != '.mp3':
                 ext = '.mp3'
-            elif category == 'pro':
+            elif category == 'pro' and ext != '.mp4':
                 ext = '.mp4'
 
             safe_title = f'{title}{ext}'
 
-            @after_this_request
-            def cleanup(response):
-                delayed_delete(downloaded_file)
-                return response
-
-            return send_file(
-                downloaded_file,
-                as_attachment=True,
-                download_name=safe_title,
-                mimetype='application/octet-stream'
-            )
-
+            prog['file_path'] = downloaded_file
+            prog['safe_title'] = safe_title
+            prog['done'] = True
+            prog['status'] = 'complete'
+            
     except Exception as e:
         for f in os.listdir(DOWNLOAD_DIR):
             if f.startswith(unique_id):
@@ -367,10 +393,64 @@ def download():
                     os.remove(os.path.join(DOWNLOAD_DIR, f))
                 except OSError:
                     pass
+        
         error_msg = str(e).lower()
         if 'private' in error_msg or 'sign in' in error_msg or 'age' in error_msg:
-            return jsonify({'error': 'This video is restricted. Please try a public video.'}), 403
-        return jsonify({'error': f'Download failed. {str(e)[:200]}'}), 500
+            prog['error'] = 'This video is restricted. Please try a public video.'
+        else:
+            prog['error'] = f'Download failed. {str(e)[:200]}'
+        prog['done'] = True
+
+    def _cleanup():
+        time.sleep(3600)  # Keep session alive for 1 hour so they can download it
+        single_progress.pop(session_id, None)
+    threading.Thread(target=_cleanup, daemon=True).start()
+
+@app.route('/single_progress/<session_id>')
+def get_single_progress(session_id):
+    def generate():
+        while True:
+            prog = single_progress.get(session_id)
+            if not prog:
+                data = json.dumps({'error': 'Session not found', 'done': True})
+                yield f'data: {data}\n\n'
+                break
+                
+            data = json.dumps({
+                'status': prog['status'],
+                'percent': prog['percent'],
+                'done': prog['done'],
+                'error': prog['error']
+            })
+            yield f'data: {data}\n\n'
+            
+            if prog['done']:
+                break
+            time.sleep(1)
+    return Response(generate(), mimetype='text/event-stream')
+
+@app.route('/download_file/<session_id>')
+def download_file(session_id):
+    """Deliver the actual file to the browser once it is fully created."""
+    prog = single_progress.get(session_id)
+    if not prog or not prog.get('file_path'):
+        return jsonify({'error': 'File not ready or expired.'}), 404
+        
+    file_path = prog['file_path']
+    safe_title = prog['safe_title']
+    
+    @after_this_request
+    def cleanup(response):
+        delayed_delete(file_path)
+        single_progress.pop(session_id, None)
+        return response
+
+    return send_file(
+        file_path,
+        as_attachment=True,
+        download_name=safe_title,
+        mimetype='application/octet-stream'
+    )
 
 
 @app.route('/download_playlist', methods=['POST'])

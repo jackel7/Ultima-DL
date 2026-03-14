@@ -65,6 +65,18 @@
             </div>
         </section>
 
+        <!-- Single Video Progress -->
+        <section class="progress-section" id="single-progress-section" style="display:none; margin-top: 20px;">
+            <div class="progress-header">
+                <span class="progress-label" id="single-progress-label">Downloading Video...</span>
+                <span class="progress-count" id="single-progress-percent">0%</span>
+            </div>
+            <div class="progress-bar-track">
+                <div class="progress-bar-fill" id="single-progress-bar-fill" style="width:0%"></div>
+            </div>
+            <p class="progress-current" id="single-progress-status" style="margin-top: 12px; font-size: 0.9rem; color: var(--text-muted);"></p>
+        </section>
+
         <section class="formats-section" id="formats-section">
             <div class="format-tabs">
                 <button class="tab-btn active" data-tab="standard" onclick="switchTab('standard')">
@@ -265,20 +277,87 @@
         async function downloadFile(formatId, category) {
             const btn = document.getElementById(`dl-btn-${formatId}`);
             if (!btn || btn.disabled) return;
-            btn.disabled = true; btn.classList.add('loading');
-            showDownloadStatus('⏳ Preparing your download...', '');
+            
+            // Hide formats list and show the big progress bar
+            document.getElementById('formats-section').style.display = 'none';
+            const progressSec = document.getElementById('single-progress-section');
+            progressSec.style.display = 'block';
+            
+            const progLabel = document.getElementById('single-progress-label');
+            const progPercent = document.getElementById('single-progress-percent');
+            const progBar = document.getElementById('single-progress-bar-fill');
+            const progStatus = document.getElementById('single-progress-status');
+            
+            progLabel.textContent = 'Preparing Download...';
+            progPercent.textContent = '0%';
+            progBar.style.width = '0%';
+            progStatus.textContent = 'Connecting to server...';
+            progBar.style.backgroundColor = 'var(--accent)';
+            
             try {
-                const resp = await fetch('/download', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({url:currentUrl,format_id:formatId,category}) });
-                if (!resp.ok) { const e = await resp.json(); throw new Error(e.error || 'Download failed.'); }
-                const blob = await resp.blob();
-                const cd = resp.headers.get('Content-Disposition');
-                let filename = 'video.mp4';
-                if (cd) { const m = cd.match(/filename\*?=(?:UTF-8''|"?)([^";]+)/i); if (m) filename = decodeURIComponent(m[1].replace(/"/g,'')); }
-                const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = filename;
-                document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(a.href);
-                showDownloadStatus('✅ Download started!', 'success'); setTimeout(hideDownloadStatus, 4000);
-            } catch (err) { showDownloadStatus(`❌ ${err.message}`, 'error'); setTimeout(hideDownloadStatus, 6000); }
-            finally { btn.disabled = false; btn.classList.remove('loading'); }
+                const resp = await fetch('/start_download', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({url:currentUrl,format_id:formatId,category}) });
+                const data = await resp.json();
+                if (!resp.ok) throw new Error(data.error || 'Failed to start download.');
+                
+                const sessionId = data.session_id;
+                const source = new EventSource(`/single_progress/${sessionId}`);
+                
+                source.onmessage = (event) => {
+                    const prog = JSON.parse(event.data);
+                    
+                    if (prog.error && prog.done) {
+                        source.close();
+                        progLabel.textContent = 'Download Failed';
+                        progStatus.textContent = prog.error;
+                        progBar.style.backgroundColor = '#ef4444';
+                        showDownloadStatus(`❌ ${prog.error}`, 'error');
+                        setTimeout(hideDownloadStatus, 6000);
+                        return;
+                    }
+                    
+                    // Parse percentage
+                    let percentVal = 0;
+                    if (prog.percent && prog.percent.includes('%')) {
+                        percentVal = parseFloat(prog.percent.replace('%',''));
+                    }
+                    
+                    progLabel.textContent = prog.status.includes('Finalizing') ? 'Merging Video & Audio...' : 'Downloading...';
+                    progPercent.textContent = prog.percent;
+                    progBar.style.width = `${percentVal}%`;
+                    progStatus.textContent = prog.status;
+                    
+                    if (prog.done && !prog.error) {
+                        source.close();
+                        progLabel.textContent = 'Download Complete!';
+                        progStatus.textContent = 'Saving file to your PC...';
+                        progPercent.textContent = '100%';
+                        progBar.style.width = '100%';
+                        progBar.style.backgroundColor = '#10b981'; // Green
+                        
+                        showDownloadStatus('✅ Download ready! Saving to PC...', 'success');
+                        setTimeout(hideDownloadStatus, 4000);
+                        
+                        // Trigger the actual file download
+                        window.location.href = `/download_file/${sessionId}`;
+                    }
+                };
+                
+                source.onerror = () => {
+                    source.close();
+                    progLabel.textContent = 'Connection Error';
+                    progStatus.textContent = 'Lost connection to background download.';
+                    progBar.style.backgroundColor = '#ef4444';
+                    showDownloadStatus('❌ Lost connection to server.', 'error');
+                    setTimeout(hideDownloadStatus, 6000);
+                };
+
+            } catch (err) { 
+                progLabel.textContent = 'Error';
+                progStatus.textContent = err.message;
+                progBar.style.backgroundColor = '#ef4444';
+                showDownloadStatus(`❌ ${err.message}`, 'error'); 
+                setTimeout(hideDownloadStatus, 6000); 
+            }
         }
 
         // ---- Playlist ----
@@ -451,7 +530,7 @@
         function setFetchLoading(l) { fetchBtn.disabled=l; fetchBtnText.style.display=l?'none':'inline'; fetchSpinner.style.display=l?'inline-block':'none'; }
         function showLoading(t) { loadingTextEl.innerHTML = t + '<span class="loading-dots"></span>'; loadingSection.classList.add('visible'); }
         function hideLoading() { loadingSection.classList.remove('visible'); }
-        function hideResults() { previewCard.classList.remove('visible'); formatsSection.classList.remove('visible'); playlistSection.style.display = 'none'; }
+        function hideResults() { previewCard.classList.remove('visible'); formatsSection.classList.remove('visible'); playlistSection.style.display = 'none'; document.getElementById('single-progress-section').style.display = 'none'; }
         function showDownloadStatus(t,type) { downloadStatusText.textContent=t; downloadStatus.className='download-status visible'+(type?` ${type}`:''); }
         function hideDownloadStatus() { downloadStatus.classList.remove('visible'); }
     </script>
