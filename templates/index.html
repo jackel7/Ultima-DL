@@ -125,14 +125,26 @@
                 <div class="quality-grid" id="quality-grid"></div>
             </div>
 
+            <!-- Playlist Actions Selection -->
+            <div style="display: flex; justify-content: space-between; align-items: center; margin: 15px 0 5px 0; font-size: 13px;">
+                <span id="selected-count" style="color: var(--accent); font-weight: 600;">0 selected</span>
+                <div style="display: flex; gap: 10px;">
+                    <button id="btn-select-all" onclick="toggleAllPlaylist(true)" style="background:none; border:none; color:var(--text-primary); cursor:pointer; font-size:12px; padding:0;">Select All</button>
+                    <button id="btn-deselect-all" onclick="toggleAllPlaylist(false)" style="background:none; border:none; color:var(--text-muted); cursor:pointer; font-size:12px; padding:0;">Deselect All</button>
+                </div>
+            </div>
+
             <!-- Video List -->
             <div class="playlist-videos" id="playlist-videos"></div>
 
             <!-- Download All Button -->
-            <div class="playlist-actions">
-                <button class="download-all-btn" id="download-all-btn" onclick="downloadPlaylist()">
+            <div class="playlist-actions" style="display: flex; gap: 10px;">
+                <button class="download-all-btn" id="download-all-btn" onclick="downloadPlaylist()" style="flex: 1;">
                     <span id="dl-all-text">⬇ Download All to Folder</span>
                     <div class="btn-spinner" id="dl-all-spinner" style="display:none;width:16px;height:16px;border:2px solid rgba(255,255,255,0.3);border-top-color:white;border-radius:50%;animation:spin 0.6s linear infinite;"></div>
+                </button>
+                <button class="cancel-download-btn" id="cancel-download-btn" onclick="cancelPlaylist()" style="display:none; background: #1a1a1a; color: #ff4a4a; border: 1px solid #ff4a4a; border-radius: 8px; padding: 0 24px; font-weight: 600; cursor: pointer; transition: all 0.2s;">
+                    Cancel
                 </button>
             </div>
 
@@ -167,6 +179,7 @@
         let videoData = null;
         let playlistData = null;
         let selectedQuality = 'best';
+        let activeSessionId = null;
 
         const urlInput       = document.getElementById('url-input');
         const inputWrapper   = document.getElementById('input-wrapper');
@@ -182,6 +195,20 @@
         const playlistSection = document.getElementById('playlist-section');
         const downloadStatus = document.getElementById('download-status');
         const downloadStatusText = document.getElementById('download-status-text');
+
+        // Auto-fetch from URL Params
+        window.addEventListener('DOMContentLoaded', () => {
+            const params = new URLSearchParams(window.location.search);
+            const autoUrl = params.get('url');
+            const autoMode = params.get('mode') || 'video';
+            if (autoUrl) {
+                urlInput.value = autoUrl;
+                setMode(autoMode);
+                handleFetch();
+                // Optionally hide the params so the URL looks clean
+                window.history.replaceState({}, document.title, window.location.pathname);
+            }
+        });
 
         urlInput.addEventListener('keydown', e => { if (e.key === 'Enter') handleFetch(); });
         urlInput.addEventListener('input', () => { hideError(); inputWrapper.classList.remove('shake', 'error-state'); });
@@ -395,7 +422,24 @@
             data.videos.forEach(v => {
                 const item = document.createElement('div');
                 item.className = 'playlist-video-item';
-                item.innerHTML = `<span class="pv-index">${v.index}</span><div class="pv-info"><span class="pv-title">${v.title}</span><span class="pv-duration">${v.duration}</span></div>`;
+                item.innerHTML = `
+                    <div style="display:flex; align-items:center; gap: 10px;">
+                        <input type="checkbox" class="playlist-checkbox" value="${v.index}" checked style="width: 16px; height: 16px; cursor: pointer; accent-color: var(--accent);">
+                        <span class="pv-index">${v.index}</span>
+                    </div>
+                    <div class="pv-info">
+                        <span class="pv-title">${v.title}</span><span class="pv-duration">${v.duration}</span>
+                    </div>
+                `;
+                item.style.cursor = 'pointer';
+                const cb = item.querySelector('input');
+                cb.addEventListener('change', updateSelectedCount);
+                item.addEventListener('click', (e) => {
+                    if(e.target.tagName !== 'INPUT') {
+                        cb.checked = !cb.checked;
+                        updateSelectedCount();
+                    }
+                });
                 list.appendChild(item);
             });
 
@@ -403,11 +447,39 @@
             document.getElementById('progress-section').style.display = 'none';
             playlistSection.style.display = 'block';
             playlistSection.style.animation = 'fadeSlideUp 0.5s ease-out';
+            updateSelectedCount();
         }
 
         function selectQuality(quality) {
             selectedQuality = quality;
             document.querySelectorAll('.quality-card').forEach(c => c.classList.toggle('selected', c.dataset.quality === quality));
+        }
+
+        function toggleAllPlaylist(state) {
+            document.querySelectorAll('.playlist-checkbox').forEach(cb => cb.checked = state);
+            updateSelectedCount();
+        }
+
+        async function cancelPlaylist() {
+            if (!activeSessionId) return;
+            const btn = document.getElementById('cancel-download-btn');
+            btn.textContent = 'Canceling...';
+            btn.disabled = true;
+            try {
+                await fetch(`/cancel_playlist/${activeSessionId}`, { method: 'POST' });
+            } catch(e) {}
+        }
+
+        function updateSelectedCount() {
+            const total = document.querySelectorAll('.playlist-checkbox').length;
+            const selected = document.querySelectorAll('.playlist-checkbox:checked').length;
+            const countEl = document.getElementById('selected-count');
+            if(countEl) countEl.textContent = `${selected} of ${total} selected`;
+            
+            const btnText = document.getElementById('dl-all-text');
+            if(btnText) btnText.textContent = `⬇ Download ${selected} Video${selected === 1 ? '' : 's'} to Folder`;
+            
+            document.getElementById('download-all-btn').disabled = (selected === 0);
         }
 
         async function downloadPlaylist() {
@@ -417,6 +489,13 @@
                 document.getElementById('folder-input').focus();
                 return;
             }
+
+            const selectedCheckboxes = Array.from(document.querySelectorAll('.playlist-checkbox:checked'));
+            if (selectedCheckboxes.length === 0) {
+                showError('Please select at least one video to download.');
+                return;
+            }
+            const selectedIndices = selectedCheckboxes.map(cb => parseInt(cb.value));
 
             const btn = document.getElementById('download-all-btn');
             const btnText = document.getElementById('dl-all-text');
@@ -429,13 +508,18 @@
                 const resp = await fetch('/download_playlist', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ url: currentUrl, quality: selectedQuality, folder: folder })
+                    body: JSON.stringify({ url: currentUrl, quality: selectedQuality, folder: folder, indices: selectedIndices })
                 });
                 const data = await resp.json();
                 if (!resp.ok) throw new Error(data.error || 'Failed to start download.');
 
                 // Show progress and listen to SSE
                 const sessionId = data.session_id;
+                activeSessionId = sessionId;
+                document.getElementById('cancel-download-btn').style.display = 'block';
+                document.getElementById('cancel-download-btn').textContent = 'Cancel';
+                document.getElementById('cancel-download-btn').disabled = false;
+                
                 showProgress();
                 listenProgress(sessionId);
 
@@ -497,6 +581,12 @@
             source.onerror = () => {
                 source.close();
                 resetDownloadBtn();
+                const progLabel = document.getElementById('progress-label');
+                if(progLabel) progLabel.textContent = '❌ Connection Error';
+                const progCurrent = document.getElementById('progress-current');
+                if(progCurrent) progCurrent.textContent = 'Lost connection to background download. Server might have restarted.';
+                document.getElementById('progress-bar-fill').style.backgroundColor = '#ef4444';
+                showError('Lost connection to server during playlist download.');
             };
         }
 
@@ -505,6 +595,8 @@
             const btnText = document.getElementById('dl-all-text');
             const spinner = document.getElementById('dl-all-spinner');
             btn.disabled = false; btnText.style.display = 'inline'; spinner.style.display = 'none';
+            document.getElementById('cancel-download-btn').style.display = 'none';
+            activeSessionId = null;
         }
 
         // ---- Browse Folder ----

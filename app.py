@@ -4,11 +4,16 @@ import uuid
 import threading
 import time
 import json
+import tempfile
+import random
 from flask import Flask, render_template, request, jsonify, send_file, after_this_request, Response
+from flask_cors import CORS
 
 app = Flask(__name__)
+CORS(app)  # Enable CORS for the browser extension
 
-DOWNLOAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'downloads')
+# Use local downloads folder so user can see them while being downloaded
+DOWNLOAD_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), 'downloads'))
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 # Store playlist download progress per session
@@ -35,6 +40,27 @@ def format_duration(seconds):
     if hours > 0:
         return f'{hours}:{minutes:02d}:{secs:02d}'
     return f'{minutes}:{secs:02d}'
+
+
+# --- Network Retry Settings ---
+MAX_RETRIES = 6
+RETRY_DELAY = 5  # seconds between retries
+
+NETWORK_ERROR_KEYWORDS = [
+    'timed out', 'timeout', 'connection reset', 'connection refused',
+    'connection aborted', 'broken pipe', 'network is unreachable',
+    'name resolution', 'dns', 'temporary failure', 'errno 11001',
+    'urlopen error', 'incomplete read', 'connection error',
+    'remotedisconnected', 'incompleteread', 'sslerror',
+    'eof occurred', 'reset by peer', '429', 'too many requests',
+    'rate-limit', 'rate limit', '10054', 'connectionreseterror'
+]
+
+
+def _is_network_error(error):
+    """Check if an exception is a recoverable network error."""
+    msg = str(error).lower()
+    return any(kw in msg for kw in NETWORK_ERROR_KEYWORDS)
 
 
 def delayed_delete(filepath, delay=5):
@@ -185,6 +211,7 @@ def extract():
         'ignoreerrors': False,
         'noplaylist': True,
         'socket_timeout': 30,
+        'extractor_args': {'youtube': ['player_client=android,tv,web']},
     }
 
     try:
@@ -239,6 +266,8 @@ def extract_playlist():
         'skip_download': True,
         'extract_flat': True,
         'socket_timeout': 30,
+        'ignoreerrors': True,
+        'extractor_args': {'youtube': ['player_client=android,tv,web']},
     }
 
     try:
@@ -266,6 +295,8 @@ def extract_playlist():
 
             quality_presets = [
                 {'id': 'best', 'label': 'Best Quality', 'desc': 'Highest available'},
+                {'id': 'm4a', 'label': '🔥 Original M4A', 'desc': 'Best Sound / Small Size (~3MB)'},
+                {'id': 'audio', 'label': '🎵 MP3 Audio', 'desc': 'Standard MP3 (~3.5MB)'},
                 {'id': '2160', 'label': '4K (2160p)', 'desc': 'Ultra HD'},
                 {'id': '1440', 'label': '1440p', 'desc': 'Quad HD'},
                 {'id': '1080', 'label': '1080p', 'desc': 'Full HD'},
@@ -273,7 +304,6 @@ def extract_playlist():
                 {'id': '480', 'label': '480p', 'desc': 'Standard'},
                 {'id': '360', 'label': '360p', 'desc': 'Low'},
                 {'id': '240', 'label': '240p', 'desc': 'Very Low'},
-                {'id': 'audio', 'label': 'Audio Only', 'desc': 'MP3 320kbps'},
             ]
 
             return jsonify({
@@ -342,63 +372,104 @@ def _single_download_worker(url, format_id, category, session_id):
         'noplaylist': True,
         'socket_timeout': 30,
         'progress_hooks': [progress_hook],
+        'extractor_args': {'youtube': ['player_client=android,tv,web']},
     }
 
     if category == 'pro':
         ydl_opts['format'] = f'{format_id}+bestaudio/best'
         ydl_opts['merge_output_format'] = 'mp4'
+    elif category == 'm4a':
+        ydl_opts['format'] = 'bestaudio[ext=m4a]/bestaudio'
+        # Crucially: we do NOT use FFmpegExtractAudio post-processor so we preserve the pure 100% original quality
     elif category == 'audio':
         ydl_opts['format'] = format_id
         ydl_opts['postprocessors'] = [{
             'key': 'FFmpegExtractAudio',
             'preferredcodec': 'mp3',
-            'preferredquality': '320',
+            'preferredquality': '128',
         }]
     else:
         ydl_opts['format'] = format_id
 
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            prog['status'] = 'Fetching info...'
-            info = ydl.extract_info(url, download=True)
-            prog['status'] = 'Finalizing file...'
-            title = sanitize_filename(info.get('title', 'video'))
+    last_error = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            # Clean up any partial files from previous attempts
+            if attempt > 1:
+                for f in os.listdir(DOWNLOAD_DIR):
+                    if f.startswith(unique_id):
+                        try:
+                            os.remove(os.path.join(DOWNLOAD_DIR, f))
+                        except OSError:
+                            pass
 
-            downloaded_file = None
-            for f in os.listdir(DOWNLOAD_DIR):
-                if f.startswith(unique_id):
-                    downloaded_file = os.path.join(DOWNLOAD_DIR, f)
-                    break
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                prog['status'] = 'Fetching info...' if attempt == 1 else f'Retrying... (attempt {attempt}/{MAX_RETRIES})'
+                info = ydl.extract_info(url, download=True)
+                if info is None:
+                    raise Exception("Download returned None (rate limit or unavailable)")
+                prog['status'] = 'Finalizing file...'
+                title = sanitize_filename(info.get('title', 'video'))
 
-            if not downloaded_file or not os.path.exists(downloaded_file):
-                raise Exception('Download failed. File not found.')
+                downloaded_file = None
+                for f in os.listdir(DOWNLOAD_DIR):
+                    if f.startswith(unique_id):
+                        downloaded_file = os.path.join(DOWNLOAD_DIR, f)
+                        break
 
-            ext = os.path.splitext(downloaded_file)[1]
-            if category == 'audio' and ext != '.mp3':
-                ext = '.mp3'
-            elif category == 'pro' and ext != '.mp4':
-                ext = '.mp4'
+                if not downloaded_file or not os.path.exists(downloaded_file):
+                    raise Exception('Download failed. File not found.')
 
-            safe_title = f'{title}{ext}'
+                ext = os.path.splitext(downloaded_file)[1]
+                if category == 'audio' and ext != '.mp3':
+                    ext = '.mp3'
+                elif category == 'pro' and ext != '.mp4':
+                    ext = '.mp4'
 
-            prog['file_path'] = downloaded_file
-            prog['safe_title'] = safe_title
-            prog['done'] = True
-            prog['status'] = 'complete'
-            
-    except Exception as e:
+                safe_title = f'{title}{ext}'
+
+                prog['file_path'] = downloaded_file
+                prog['safe_title'] = safe_title
+                prog['done'] = True
+                prog['status'] = 'complete'
+                last_error = None
+                break  # Success
+
+        except Exception as e:
+            last_error = e
+            error_clean = re.sub(r'\x1b[^m]*m', '', str(e))
+            error_msg = error_clean.lower()
+            if 'private' in error_msg or 'sign in' in error_msg or 'age' in error_msg or 'bot' in error_msg:
+                break
+
+            if attempt < MAX_RETRIES and (_is_network_error(e) or '429' in error_msg or 'rate' in error_msg or '10054' in error_msg):
+                backoff = RETRY_DELAY * (2 ** (attempt - 1))
+                if backoff > 60:
+                    backoff = 60
+                prog['status'] = f'Network drop. Waiting {backoff}s for internet... ({attempt}/{MAX_RETRIES})'
+                prog['percent'] = '0%'
+                time.sleep(backoff)
+                continue
+            else:
+                break
+
+    # Handle final failure after all retries
+    if last_error:
         for f in os.listdir(DOWNLOAD_DIR):
             if f.startswith(unique_id):
                 try:
                     os.remove(os.path.join(DOWNLOAD_DIR, f))
                 except OSError:
                     pass
-        
-        error_msg = str(e).lower()
-        if 'private' in error_msg or 'sign in' in error_msg or 'age' in error_msg:
-            prog['error'] = 'This video is restricted. Please try a public video.'
+
+        error_clean = re.sub(r'\x1b[^m]*m', '', str(last_error))
+        error_msg = error_clean.lower()
+        if 'private' in error_msg or 'sign in' in error_msg or 'age' in error_msg or 'bot' in error_msg:
+            prog['error'] = 'YouTube blocked this download (Sign-in / Bot Check required).'
+        elif _is_network_error(last_error):
+            prog['error'] = f'Network error after {MAX_RETRIES} attempts. Check your connection and try again.'
         else:
-            prog['error'] = f'Download failed. {str(e)[:200]}'
+            prog['error'] = f'Download failed. {error_clean[:200]}'
         prog['done'] = True
 
     def _cleanup():
@@ -462,6 +533,8 @@ def download_playlist():
     url = data.get('url', '').strip()
     quality = data.get('quality', 'best')
     folder = data.get('folder', '').strip()
+    selected_indices = data.get('indices', []) # List of 1-based indices to download
+    print(f"[DEBUG] download_playlist called! indices received: {selected_indices}")
 
     if not url:
         return jsonify({'error': 'Missing playlist URL.'}), 400
@@ -490,7 +563,7 @@ def download_playlist():
     # Start download in background thread
     thread = threading.Thread(
         target=_download_playlist_worker,
-        args=(url, quality, folder, session_id),
+        args=(url, quality, folder, session_id, selected_indices),
         daemon=True
     )
     thread.start()
@@ -498,7 +571,7 @@ def download_playlist():
     return jsonify({'session_id': session_id})
 
 
-def _download_playlist_worker(url, quality, folder, session_id):
+def _download_playlist_worker(url, quality, folder, session_id, selected_indices):
     """Background worker that downloads each video and updates progress."""
     import yt_dlp
 
@@ -512,23 +585,30 @@ def _download_playlist_worker(url, quality, folder, session_id):
         'skip_download': True,
         'extract_flat': True,
         'socket_timeout': 30,
+        'ignoreerrors': True,
     }
 
     try:
         with yt_dlp.YoutubeDL(extract_opts) as ydl:
             info = ydl.extract_info(url, download=False)
-            entries = [e for e in (info.get('entries', []) or []) if e is not None]
+            entries = info.get('entries', []) or []
             playlist_title = sanitize_filename(info.get('title', 'Playlist'))
 
-        if not entries:
-            progress['status'] = 'error'
-            progress['errors'].append('No videos found in playlist.')
-            progress['done'] = True
-            return
+        # Filter entries based on selected_indices AND skip unavailable videos
+        if selected_indices:
+            entries_to_download = [(i, e) for i, e in enumerate(entries) if e is not None and (i + 1) in selected_indices]
+        else:
+            entries_to_download = [(i, e) for i, e in enumerate(entries) if e is not None]
 
-        progress['total'] = len(entries)
+        if not entries_to_download:
+             progress['status'] = 'error'
+             progress['errors'].append('No valid videos found or selected.')
+             progress['done'] = True
+             return
+
+        progress['total'] = len(entries_to_download)
         progress['status'] = 'downloading'
-
+        
         # Create subfolder with playlist name
         save_dir = os.path.join(folder, playlist_title)
         os.makedirs(save_dir, exist_ok=True)
@@ -542,18 +622,29 @@ def _download_playlist_worker(url, quality, folder, session_id):
             format_str = f'bestvideo[height<={quality}]+bestaudio/best[height<={quality}]/best'
 
         # Download each video one by one
-        for i, entry in enumerate(entries):
+        current_download_idx = 0
+        for i, entry in entries_to_download:
+            if progress.get('canceled'):
+                progress['status'] = 'Canceled'
+                progress['errors'].append('Playlist download canceled by user.')
+                break
+                
+            current_download_idx += 1
             video_url = entry.get('url') or entry.get('webpage_url', '')
             video_title = entry.get('title', f'Video {i+1}')
 
             if not video_url:
                 progress['errors'].append(f'#{i+1}: No URL found')
-                progress['current'] = i + 1
+                progress['current'] = current_download_idx
                 continue
 
-            progress['current'] = i + 1
+            progress['current'] = current_download_idx
             progress['current_title'] = video_title
-            progress['status'] = f'Downloading {i+1}/{len(entries)}'
+            progress['status'] = f'Downloading {current_download_idx}/{len(entries_to_download)}'
+
+            def _cancel_hook(d):
+                if progress.get('canceled'):
+                    raise Exception('Download Canceled By User')
 
             ydl_opts = {
                 'nocheckcertificate': True,
@@ -564,24 +655,58 @@ def _download_playlist_worker(url, quality, folder, session_id):
                 'noplaylist': True,
                 'socket_timeout': 30,
                 'format': format_str,
-                'ignoreerrors': True,
+                'ignoreerrors': False,
+                'progress_hooks': [_cancel_hook],
+                'extractor_args': {'youtube': ['player_client=android,tv,web']},
             }
 
-            if quality != 'audio':
+            if quality == 'm4a':
+                ydl_opts['format'] = 'bestaudio[ext=m4a]/bestaudio'
+            elif quality != 'audio':
                 ydl_opts['merge_output_format'] = 'mp4'
             else:
                 ydl_opts['postprocessors'] = [{
                     'key': 'FFmpegExtractAudio',
                     'preferredcodec': 'mp3',
-                    'preferredquality': '320',
+                    'preferredquality': '128',
                 }]
 
-            try:
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    ydl.extract_info(video_url, download=True)
-                    progress['completed'].append(video_title)
-            except Exception as e:
-                progress['errors'].append(f'#{i+1} {video_title}: {str(e)[:80]}')
+            video_success = False
+            for attempt in range(1, MAX_RETRIES + 1):
+                try:
+                    if attempt > 1:
+                        progress['status'] = f'Retrying #{i+1} (attempt {attempt}/{MAX_RETRIES})'
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                        info = ydl.extract_info(video_url, download=True)
+                        if info is None:
+                            raise Exception("Download returned None (rate limit or unavailable)")
+                        progress['completed'].append(video_title)
+                        video_success = True
+                        break
+                except Exception as e:
+                    error_clean = re.sub(r'\x1b[^m]*m', '', str(e))
+                    error_msg = error_clean.lower()
+                    if attempt < MAX_RETRIES and (_is_network_error(e) or '429' in error_msg or 'rate' in error_msg or '10054' in error_msg):
+                        backoff = RETRY_DELAY * (2 ** (attempt - 1))
+                        if backoff > 60:
+                            backoff = 60
+                        progress['status'] = f'No internet! Waiting {backoff}s for connection to return... (attempt {attempt}/{MAX_RETRIES})'
+                        time.sleep(backoff)
+                        continue
+                    
+                    if 'bot' in error_msg or 'sign in' in error_msg:
+                        progress['errors'].append(f'#{i+1} {video_title}: YouTube Bot Blocked (Try again later)')
+                    else:
+                        progress['errors'].append(f'#{i+1} {video_title}: {error_clean[:150]}')
+                    break
+            
+            # If we have downloaded a batch of 30 videos, take a larger human-like break
+            if current_download_idx % 30 == 0 and current_download_idx < len(entries_to_download):
+                progress['status'] = f'Cooldown pause to avoid bot detection... (resuming soon)'
+                time.sleep(random.uniform(15.0, 25.0))
+            else:
+                # Use a random delay between 4 and 9 seconds to simulate human click times
+                time.sleep(random.uniform(4.0, 9.0))
 
         progress['status'] = 'complete'
         progress['done'] = True
@@ -630,6 +755,14 @@ def get_playlist_progress(session_id):
 
     return Response(generate(), mimetype='text/event-stream',
                     headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'})
+
+
+@app.route('/cancel_playlist/<session_id>', methods=['POST'])
+def cancel_playlist(session_id):
+    if session_id in playlist_progress:
+        playlist_progress[session_id]['canceled'] = True
+        return jsonify({'status': 'canceling'})
+    return jsonify({'error': 'Session not found'}), 404
 
 
 if __name__ == '__main__':

@@ -40,14 +40,10 @@ pip install flask yt-dlp
 *(Alternatively, you can run `pip install -r requirements.txt`)*
 
 ### Step 4: Run the App
-Start the local server:
-```bash
-python app.py
-```
+Start the app easily:
+**Just double click the `Ultima-DL.bat` file!** It will automatically install missing libraries, start the local server, and pop open the UI in your web browser!
 
-### Step 5: Open in Browser
-Once the server is running, open your web browser and click this link:  
-👉 **[http://127.0.0.1:5000](http://127.0.0.1:5000)**
+*(Alternatively, you can manually run `python app.py` and open `http://127.0.0.1:5000` in your browser)*
 
 *(Note: Keep the black terminal window open while you are downloading videos!)*
 
@@ -55,9 +51,10 @@ Once the server is running, open your web browser and click this link:
 
 ## ✨ Features
 * **🎬 Single Video Mode:** Download exactly the resolution you want (144p up to 4K), or extract high-quality audio (MP3).
-* **📋 Playlist Mode:** Paste a playlist link, pick a single quality preset, and instantly download the entire playlist straight to a folder.
+* **📋 Advanced Playlist Mode:** Extract entire playlists, selectively check/uncheck specific videos, and seamlessly download massive 400+ video queues with built-in anti-bot IP-evasion cooldowns!
+* **🛑 Download Control:** Cancel any active playlist downloads instantly with the click of a button.
 * **⚡ Pro Video Merging:** Uses `FFmpeg` to seamlessly multiplex separated YouTube streams into one perfect `.mp4`.
-* **👀 Real-Time Progress:** Beautiful custom UI that tracks background downloads.
+* **👀 Real-Time Progress:** Beautiful custom UI that live-tracks background downloads and auto-recovers from dropped connections.
 
 ---
 
